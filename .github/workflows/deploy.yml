@@ -1,0 +1,149 @@
+name: Deploy Next.js to S3 via CloudFront
+
+# This workflow deploys the Next.js app to S3 and invalidates CloudFront cache
+# Infrastructure (S3 bucket, CloudFront distribution, bucket policies) is managed by Terraform
+# See infra/ directory for infrastructure as code
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build Next.js project
+        run: pnpm build
+
+      - name: Verify build output
+        run: |
+          echo "🔍 Checking build output..."
+          if [ ! -d "out" ]; then
+            echo "❌ Error: 'out' directory not found!"
+            echo "Build might have failed. Checking for errors..."
+            exit 1
+          fi
+          echo "✅ Build output directory exists"
+          echo "📁 Contents of out/ directory:"
+          ls -la out/ | head -20
+          echo "📊 Total files: $(find out -type f | wc -l)"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS access and S3 bucket
+        run: |
+          echo "🔍 Verifying AWS credentials..."
+          aws sts get-caller-identity
+          
+          echo "🔍 Checking S3 bucket access..."
+          if aws s3 ls s3://${{ secrets.S3_BUCKET }} 2>&1; then
+            echo "✅ S3 bucket accessible: ${{ secrets.S3_BUCKET }}"
+            echo "📁 Current files in bucket:"
+            aws s3 ls s3://${{ secrets.S3_BUCKET }} --recursive | head -10
+          else
+            echo "❌ Error: Cannot access S3 bucket: ${{ secrets.S3_BUCKET }}"
+            echo "Please check:"
+            echo "  1. Bucket name is correct"
+            echo "  2. AWS credentials have s3:ListBucket permission"
+            exit 1
+          fi
+
+      - name: Upload build to S3
+        run: |
+          set -e  # Exit on any error
+          
+          echo "📤 Starting S3 upload..."
+          echo "📦 Bucket: ${{ secrets.S3_BUCKET }}"
+          echo "📁 Source: out/"
+          
+          # Upload static assets (JS, CSS, images, etc.) with long cache
+          echo "📤 Uploading static assets..."
+          aws s3 sync out/ s3://${{ secrets.S3_BUCKET }} \
+            --delete \
+            --exclude "*.html" \
+            --exclude "*.json" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --no-progress || {
+              echo "❌ Failed to upload static assets"
+              exit 1
+            }
+          
+          # Upload HTML files with no-cache for immediate updates
+          echo "📤 Uploading HTML files..."
+          aws s3 sync out/ s3://${{ secrets.S3_BUCKET }} \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --content-type "text/html" \
+            --no-progress || {
+              echo "❌ Failed to upload HTML files"
+              exit 1
+            }
+          
+          # Upload JSON files (like _next/static files) with appropriate cache
+          echo "📤 Uploading JSON files..."
+          aws s3 sync out/ s3://${{ secrets.S3_BUCKET }} \
+            --exclude "*" \
+            --include "*.json" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --content-type "application/json" \
+            --no-progress || {
+              echo "❌ Failed to upload JSON files"
+              exit 1
+            }
+          
+          echo "✅ Files uploaded successfully!"
+          echo "📊 Verifying upload..."
+          aws s3 ls s3://${{ secrets.S3_BUCKET }} --recursive | wc -l | xargs echo "Total files in bucket:"
+          echo "ℹ️  S3 bucket policy and CloudFront are managed by Terraform"
+
+      - name: Invalidate CloudFront cache
+        if: env.CLOUDFRONT_DISTRIBUTION_ID != ''
+        run: |
+          echo "🔄 Invalidating CloudFront cache..."
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+          echo "✅ CloudFront cache invalidation initiated"
+          echo "🌐 Website will be updated within 1-5 minutes"
